@@ -25,6 +25,7 @@ import (
 
 	"github.com/docker/machine/libmachine/drivers"
 	machinessh "github.com/docker/machine/libmachine/ssh"
+	"github.com/golang/glog"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -87,12 +88,17 @@ func Transfer(data []byte, remotedir, filename string, perm string, c *ssh.Clien
 		defer wg.Done()
 		defer w.Close()
 		header := fmt.Sprintf("C%s %d %s\n", perm, len(data), filename)
+		glog.V(8).Infoln("Sending file header", header)
 		fmt.Fprint(w, header)
 		reader := bytes.NewReader(data)
-		io.Copy(w, reader)
+		_, err := io.Copy(w, reader)
+		if err != nil {
+			glog.Errorln("Failed to transfer file:", err)
+		}
 		fmt.Fprint(w, "\x00")
 	}()
 	scpcmd := fmt.Sprintf("sudo /usr/local/bin/scp -t %s", remotedir)
+	glog.V(8).Infoln("Running", scpcmd)
 	if err := s.Run(scpcmd); err != nil {
 		return err
 	}
@@ -102,6 +108,7 @@ func Transfer(data []byte, remotedir, filename string, perm string, c *ssh.Clien
 }
 
 func RunCommand(c *ssh.Client, cmd string) error {
+	glog.V(8).Infoln("Running", cmd)
 	s, err := c.NewSession()
 	defer s.Close()
 	if err != nil {

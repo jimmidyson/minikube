@@ -32,9 +32,18 @@ var startCommandFmtStr = `
 PATH=/usr/local/sbin:$PATH nohup sudo /usr/local/bin/localkube %s --generate-certs=false --logtostderr=true > %s 2> %s < /dev/null &
 `
 
+var startOpenShiftCommandFmtStr = `
+# Run with nohup so it stays up. Redirect logs to useful places.
+cd /var/lib/localkube && nohup sudo /usr/local/bin/openshift start --listen='https://0.0.0.0:443' > %s 2> %s < /dev/null &
+`
+
 var logsCommand = fmt.Sprintf("tail -n +1 %s %s", constants.RemoteLocalKubeErrPath, constants.RemoteLocalKubeOutPath)
 
-func GetStartCommand() string {
+func GetStartCommand(config KubernetesConfig) string {
+	if config.OpenShift {
+		return fmt.Sprintf(startOpenShiftCommandFmtStr, constants.RemoteLocalKubeErrPath, constants.RemoteLocalKubeOutPath)
+	}
+
 	flagVals := make([]string, len(constants.LogFlags))
 	for _, logFlag := range constants.LogFlags {
 		if logVal := gflag.Lookup(logFlag); logVal != nil && logVal.Value.String() != logVal.DefValue {

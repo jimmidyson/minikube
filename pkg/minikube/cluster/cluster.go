@@ -17,14 +17,21 @@ limitations under the License.
 package cluster
 
 import (
+	"archive/tar"
+	"compress/gzip"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net"
+	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"golang.org/x/crypto/ssh"
 
 	"github.com/docker/machine/drivers/virtualbox"
 	"github.com/docker/machine/libmachine"
@@ -33,7 +40,9 @@ import (
 	"github.com/docker/machine/libmachine/host"
 	"github.com/docker/machine/libmachine/state"
 	"github.com/golang/glog"
+	"github.com/google/go-github/github"
 	kubeApi "k8s.io/kubernetes/pkg/api"
+	kubeUnversionedApi "k8s.io/kubernetes/pkg/api/unversioned"
 	"k8s.io/kubernetes/pkg/client/unversioned"
 	"k8s.io/kubernetes/pkg/client/unversioned/clientcmd"
 	"k8s.io/minikube/pkg/minikube/constants"
@@ -164,11 +173,36 @@ type MachineConfig struct {
 	VMDriver    string
 }
 
+type KubernetesConfig struct {
+	Version   string
+	OpenShift bool
+}
+
 // StartCluster starts a k8s cluster on the specified Host.
-func StartCluster(h sshAble) error {
-	commands := []string{stopCommand, GetStartCommand()}
+func StartCluster(h sshAble, config KubernetesConfig) error {
+	commands := []string{getStopCommand(config), GetStartCommand(config)}
 
 	for _, cmd := range commands {
+		glog.Infoln(cmd)
+		output, err := h.RunSSHCommand(cmd)
+		glog.Infoln(output)
+		if err != nil {
+			return err
+		}
+	}
+
+	if config.OpenShift {
+		for {
+			cmd := "curl --fail -k https://localhost/healthz/ready"
+			glog.Infoln(cmd)
+			output, err := h.RunSSHCommand(cmd)
+			glog.Infoln(output)
+			if err == nil {
+				break
+			}
+			<-time.After(time.Second * 1)
+		}
+		cmd := "sudo oc adm policy add-cluster-role-to-user cluster-admin admin --config=/var/lib/localkube/openshift.local.config/master/admin.kubeconfig"
 		glog.Infoln(cmd)
 		output, err := h.RunSSHCommand(cmd)
 		glog.Infoln(output)
@@ -180,20 +214,24 @@ func StartCluster(h sshAble) error {
 	return nil
 }
 
+func getStopCommand(config KubernetesConfig) string {
+	if config.OpenShift {
+		return "sudo killall openshift | true"
+	}
+	return stopCommand
+}
+
 type fileToCopy struct {
 	AssetName   string
 	TargetDir   string
 	TargetName  string
 	Permissions string
+	Contents    []byte
+	FileMode    os.FileMode
+	LinkTarget  string
 }
 
-var assets = []fileToCopy{
-	{
-		AssetName:   "out/localkube",
-		TargetDir:   "/usr/local/bin",
-		TargetName:  "localkube",
-		Permissions: "0777",
-	},
+var deployAssets = []fileToCopy{
 	{
 		AssetName:   "deploy/iso/addon-manager.yaml",
 		TargetDir:   "/etc/kubernetes/manifests/",
@@ -214,24 +252,158 @@ var assets = []fileToCopy{
 	},
 }
 
-func UpdateCluster(d drivers.Driver) error {
+var embeddedAssets = append(deployAssets,
+	fileToCopy{
+		AssetName:   "out/localkube",
+		TargetDir:   "/usr/local/bin",
+		TargetName:  "localkube",
+		Permissions: "0777",
+	},
+)
+
+func getAssets(config KubernetesConfig) ([]fileToCopy, error) {
+	if config.OpenShift {
+		return openshiftAssets(config)
+	}
+
+	if len(config.Version) > 0 {
+		return kubernetesAssets(config)
+	}
+
+	return embeddedAssets, nil
+}
+
+func kubernetesAssets(config KubernetesConfig) ([]fileToCopy, error) {
+	return embeddedAssets, nil
+}
+
+func openshiftAssets(config KubernetesConfig) ([]fileToCopy, error) {
+	var (
+		release *github.RepositoryRelease
+		resp    *github.Response
+		err     error
+	)
+	client := github.NewClient(nil)
+	if len(config.Version) > 0 {
+		release, resp, err = client.Repositories.GetReleaseByTag("openshift", "origin", "v"+config.Version)
+	} else {
+		release, resp, err = client.Repositories.GetLatestRelease("openshift", "origin")
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	assetID := getOpenShiftServerAssetID(release)
+	if assetID == 0 {
+		return nil, fmt.Errorf("Could not get OpenShift release URL")
+	}
+	asset, url, err := client.Repositories.DownloadReleaseAsset("openshift", "origin", assetID)
+	if err != nil {
+		return nil, fmt.Errorf("Could not download OpenShift release asset: %s", err)
+	}
+	if len(url) > 0 {
+		httpResp, err := http.Get(url)
+		if err != nil {
+			return nil, fmt.Errorf("Could not download OpenShift release asset: %s", err)
+		}
+		asset = httpResp.Body
+	}
+
+	defer asset.Close()
+
+	var assets []fileToCopy
+	gzf, err := gzip.NewReader(asset)
+	if err != nil {
+		return nil, fmt.Errorf("Could not ungzip OpenShift release asset: %s", err)
+	}
+	defer gzf.Close()
+	tr := tar.NewReader(gzf)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			// end of tar archive
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("Could not extract OpenShift release asset: %s", err)
+		}
+		contents, err := ioutil.ReadAll(tr)
+		if err != nil {
+			return nil, fmt.Errorf("Could not extract OpenShift release asset: %s", err)
+		}
+		assetName := filepath.Base(hdr.Name)
+		f := fileToCopy{
+			AssetName:   assetName,
+			TargetDir:   "/usr/local/bin",
+			TargetName:  assetName,
+			Permissions: "0777",
+			Contents:    contents,
+		}
+		if hdr.Typeflag == tar.TypeSymlink || hdr.Typeflag == tar.TypeLink {
+			f.FileMode = os.ModeSymlink
+			f.LinkTarget = filepath.Base(hdr.Linkname)
+		}
+		assets = append(assets, f)
+	}
+	return assets, nil
+}
+
+func getOpenShiftServerAssetID(release *github.RepositoryRelease) int {
+	for _, asset := range release.Assets {
+		if strings.HasPrefix(*asset.Name, "openshift-origin-server") && strings.HasSuffix(*asset.Name, "linux-64bit.tar.gz") {
+			return *asset.ID
+		}
+	}
+	return 0
+}
+
+func UpdateCluster(d drivers.Driver, config KubernetesConfig) error {
 	client, err := sshutil.NewSSHClient(d)
 	if err != nil {
 		return err
 	}
 
+	assets, err := getAssets(config)
+	if err != nil {
+		return err
+	}
+
 	for _, a := range assets {
-		contents, err := Asset(a.AssetName)
+		switch a.FileMode {
+		case os.ModeSymlink:
+			if err := symlinkAsset(a, client); err != nil {
+				return err
+			}
+		default:
+			if err := transferAsset(a, client); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func transferAsset(a fileToCopy, c *ssh.Client) error {
+	contents := a.Contents
+	if contents == nil {
+		c, err := Asset(a.AssetName)
 		if err != nil {
 			glog.Infof("Error loading asset %s: %s", a.AssetName, err)
 			return err
 		}
-
-		if err := sshutil.Transfer(contents, a.TargetDir, a.TargetName, a.Permissions, client); err != nil {
-			return err
-		}
+		contents = c
 	}
-	return nil
+
+	glog.V(8).Infoln("Transferring", a.TargetName, "to", a.TargetDir)
+	return sshutil.Transfer(contents, a.TargetDir, a.TargetName, a.Permissions, c)
+}
+
+func symlinkAsset(a fileToCopy, c *ssh.Client) error {
+	symlinkName := filepath.Join(a.TargetDir, a.TargetName)
+	symlinkTarget := filepath.Join(a.TargetDir, a.LinkTarget)
+	cmd := fmt.Sprintf("sudo ln -s %s %s", symlinkTarget, symlinkName)
+	return sshutil.RunCommand(c, cmd)
 }
 
 // SetupCerts gets the generated credentials required to talk to the APIServer.
@@ -398,7 +570,27 @@ func GetDashboardURL(api libmachine.API) (string, error) {
 		return "", err
 	}
 
-	port, err := getDashboardPort()
+	client, err := getClient()
+	if err != nil {
+		return "", err
+	}
+
+	b, err := client.Get().AbsPath("/").DoRaw()
+	if err != nil {
+		return "", nil
+	}
+
+	var rootPaths kubeUnversionedApi.RootPaths
+	if err := json.Unmarshal(b, &rootPaths); err != nil {
+		return "", err
+	}
+	for _, rp := range rootPaths.Paths {
+		if rp == "/oapi" {
+			return fmt.Sprintf("https://%s", ip), nil
+		}
+	}
+
+	port, err := getDashboardPort(client)
 	if err != nil {
 		return "", err
 	}
@@ -410,8 +602,8 @@ type serviceGetter interface {
 	Get(name string) (*kubeApi.Service, error)
 }
 
-func getDashboardPort() (int, error) {
-	services, err := getKubernetesServicesWithNamespace("kube-system")
+func getDashboardPort(client *unversioned.Client) (int, error) {
+	services, err := getKubernetesServicesWithNamespace(client, "kube-system")
 	if err != nil {
 		return 0, err
 	}
@@ -426,7 +618,12 @@ func getDashboardPortFromServiceGetter(services serviceGetter) (int, error) {
 	return int(dashboardService.Spec.Ports[0].NodePort), nil
 }
 
-func getKubernetesServicesWithNamespace(namespace string) (serviceGetter, error) {
+func getKubernetesServicesWithNamespace(client *unversioned.Client, namespace string) (serviceGetter, error) {
+	services := client.Services(namespace)
+	return services, nil
+}
+
+func getClient() (*unversioned.Client, error) {
 	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
 	configOverrides := &clientcmd.ConfigOverrides{}
 	kubeConfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, configOverrides)
@@ -438,6 +635,5 @@ func getKubernetesServicesWithNamespace(namespace string) (serviceGetter, error)
 	if err != nil {
 		return nil, err
 	}
-	services := client.Services(namespace)
-	return services, nil
+	return client, nil
 }

@@ -1107,6 +1107,14 @@
 			"Rev": "4dbefc9b671b81257973a33211fb12370c1a526e"
 		},
 		{
+			"ImportPath": "github.com/google/go-github/github",
+			"Rev": "92234e567776832de23193278353150f1d9605a5"
+		},
+		{
+			"ImportPath": "github.com/google/go-querystring/query",
+			"Rev": "547ef5ac979778feb2f760cdb5f4eae1a2207b86"
+		},
+		{
 			"ImportPath": "github.com/google/gofuzz",
 			"Rev": "bbcb9da2d746f8bdbd6a936686a0a6067ada0ec5"
 		},

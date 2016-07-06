@@ -33,10 +33,12 @@ import (
 )
 
 var (
-	minikubeISO string
-	memory      int
-	cpus        int
-	vmDriver    string
+	minikubeISO       string
+	memory            int
+	cpus              int
+	vmDriver          string
+	openshift         bool
+	kubernetesVersion string
 )
 
 // startCmd represents the start command
@@ -71,7 +73,12 @@ func runStart(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
-	if err := cluster.UpdateCluster(host.Driver); err != nil {
+	kubernetesConfig := cluster.KubernetesConfig{
+		OpenShift: openshift,
+		Version:   kubernetesVersion,
+	}
+
+	if err := cluster.UpdateCluster(host.Driver, kubernetesConfig); err != nil {
 		glog.Errorln("Error updating cluster: ", err)
 		os.Exit(1)
 	}
@@ -81,7 +88,7 @@ func runStart(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
-	if err := cluster.StartCluster(host); err != nil {
+	if err := cluster.StartCluster(host, kubernetesConfig); err != nil {
 		glog.Errorln("Error starting cluster: ", err)
 		os.Exit(1)
 	}
@@ -99,14 +106,22 @@ func runStart(cmd *cobra.Command, args []string) {
 	certAuth := constants.MakeMiniPath("apiserver.crt")
 	clientCert := constants.MakeMiniPath("apiserver.crt")
 	clientKey := constants.MakeMiniPath("apiserver.key")
+	clientCmd := "kubectl"
+	if openshift {
+		clientCmd = "oc"
+	}
 	if active, err := setupKubeconfig(name, kubeHost, certAuth, clientCert, clientKey); err != nil {
 		glog.Errorln("Error setting up kubeconfig: ", err)
 		os.Exit(1)
 	} else if !active {
 		fmt.Println("Run this command to use the cluster: ")
-		fmt.Printf("kubectl config use-context %s\n", name)
+		fmt.Printf("%s config use-context %s\n", clientCmd, name)
 	} else {
-		fmt.Println("Kubectl is now configured to use the cluster.")
+		fmt.Printf("%s is now configured to use the cluster.\n", clientCmd)
+	}
+	if openshift {
+		fmt.Println("Run this command to login:")
+		fmt.Printf("%s login --username=admin --password=admin --insecure-skip-tls-verify\n", clientCmd)
 	}
 }
 
@@ -157,9 +172,11 @@ func setupKubeconfig(name, server, certAuth, cliCert, cliKey string) (activeCont
 }
 
 func init() {
-	startCmd.Flags().StringVarP(&minikubeISO, "iso-url", "", constants.DefaultIsoUrl, "Location of the minikube iso")
-	startCmd.Flags().StringVarP(&vmDriver, "vm-driver", "", constants.DefaultVMDriver, fmt.Sprintf("VM driver is one of: %v", constants.SupportedVMDrivers))
-	startCmd.Flags().IntVarP(&memory, "memory", "", constants.DefaultMemory, "Amount of RAM allocated to the minikube VM")
-	startCmd.Flags().IntVarP(&cpus, "cpus", "", constants.DefaultCPUS, "Number of CPUs allocated to the minikube VM")
+	startCmd.Flags().StringVar(&minikubeISO, "iso-url", constants.DefaultIsoUrl, "Location of the minikube iso")
+	startCmd.Flags().StringVar(&vmDriver, "vm-driver", constants.DefaultVMDriver, fmt.Sprintf("VM driver is one of: %v", constants.SupportedVMDrivers))
+	startCmd.Flags().IntVar(&memory, "memory", constants.DefaultMemory, "Amount of RAM allocated to the minikube VM")
+	startCmd.Flags().IntVar(&cpus, "cpus", constants.DefaultCPUS, "Number of CPUs allocated to the minikube VM")
+	startCmd.Flags().StringVar(&kubernetesVersion, "version", "", "The version of Kubernetes/OpenShift that the minikube VM will run")
+	startCmd.Flags().BoolVar(&openshift, "openshift", false, "Run OpenShift instead of Kubernetes")
 	RootCmd.AddCommand(startCmd)
 }
